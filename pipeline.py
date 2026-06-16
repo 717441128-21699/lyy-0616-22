@@ -20,12 +20,13 @@ from alerting import AlertStage, ThresholdAlert, AggregationResultFormatter, Ale
 
 
 class Pipeline:
-    def __init__(self, name: str = "log_analysis_pipeline"):
+    def __init__(self, name: str = "pipeline", enable_monitor: bool = True):
         self.name = name
         self.sources: List[Source] = []
         self.stages: List[Stage] = []
         self._all_stages: List[Stage] = []
         self._running = False
+        self._enable_monitor = enable_monitor
         self._monitor_thread: Optional[threading.Thread] = None
 
     def add_source(self, source: Source) -> Source:
@@ -50,8 +51,9 @@ class Pipeline:
         for source in self.sources:
             source.start()
 
-        self._monitor_thread = threading.Thread(target=self._monitor, daemon=True)
-        self._monitor_thread.start()
+        if self._enable_monitor:
+            self._monitor_thread = threading.Thread(target=self._monitor, daemon=True)
+            self._monitor_thread.start()
 
     def stop(self):
         print(f"[{self.name}] Stopping pipeline...")
@@ -61,8 +63,30 @@ class Pipeline:
         for stage in self._all_stages:
             stage.stop()
 
-    def wait_until_complete(self, timeout: Optional[float] = None):
+    def flush_window_stages(self):
+        for stage in self._all_stages:
+            if hasattr(stage, 'flush') and hasattr(stage, '_window_states'):
+                try:
+                    stage.flush()
+                except:
+                    pass
+        time.sleep(1.0)
+
+    def _drain_all_queues(self, max_wait: float = 5.0) -> bool:
         start = time.time()
+        while time.time() - start < max_wait:
+            total_queued = 0
+            for stage in self._all_stages:
+                total_queued += stage.input_queue.qsize()
+            if total_queued == 0:
+                return True
+            time.sleep(0.1)
+        return False
+
+    def wait_until_complete(self, timeout: Optional[float] = None,
+                            flush_windows: bool = True):
+        start = time.time()
+
         while self._running:
             any_running = False
             for s in self.sources:
@@ -70,11 +94,16 @@ class Pipeline:
                     any_running = True
                     break
             if not any_running:
-                time.sleep(1)
                 break
             if timeout and (time.time() - start) > timeout:
                 break
             time.sleep(0.1)
+
+        if flush_windows:
+            self._drain_all_queues(max_wait=3.0)
+            self.flush_window_stages()
+            self._drain_all_queues(max_wait=2.0)
+
         self.stop()
 
     def _monitor(self):

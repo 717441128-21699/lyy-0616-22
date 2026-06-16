@@ -11,12 +11,14 @@ from core import (
 
 class MockLogSource(Source):
     def __init__(self, name: str, event_count: int = 100, rate_per_sec: float = 10.0,
-                 out_of_order_prob: float = 0.1, max_out_of_order_sec: float = 5.0):
+                 out_of_order_prob: float = 0.1, max_out_of_order_sec: float = 5.0,
+                 enable_backpressure_control: bool = True):
         super().__init__(name)
         self.event_count = event_count
         self.rate_per_sec = rate_per_sec
         self.out_of_order_prob = out_of_order_prob
         self.max_out_of_order_sec = max_out_of_order_sec
+        self.enable_bp = enable_backpressure_control
         self.sources = ["web-server-01", "web-server-02", "api-gateway", "db-master", "db-replica"]
         self.messages = {
             LogLevel.DEBUG: ["Processing request id={req_id}", "Cache hit for key={key}", "Connection pool size={size}"],
@@ -25,20 +27,53 @@ class MockLogSource(Source):
             LogLevel.ERROR: ["Connection refused to {host}:{port}", "Null pointer in {module}", "Timeout after {sec}s"],
             LogLevel.FATAL: ["Out of memory error", "Disk full on {path}", "Database crash detected"]
         }
+        self.bp_stats = {
+            "total_bp_sleep_time": 0.0,
+            "bp_slow_events": 0,
+            "green_periods": 0,
+            "yellow_periods": 0,
+            "red_periods": 0,
+            "last_signal": None
+        }
+
+    def _current_effective_rate(self) -> float:
+        if not self.enable_bp:
+            return self.rate_per_sec
+        signal = self.get_backpressure_signal()
+        if signal.value == 0:
+            return self.rate_per_sec
+        elif signal.value == 1:
+            return self.rate_per_sec * 0.4
+        else:
+            return self.rate_per_sec * 0.1
 
     def generate(self):
         base_time = time.time()
-        interval = 1.0 / self.rate_per_sec
+        base_interval = 1.0 / self.rate_per_sec
         pending_events: List[LogEvent] = []
+        last_stats_time = time.time()
+        sent_in_window = 0
 
         for i in range(self.event_count):
             if not self._running:
                 break
 
-            while self._should_slow_down() and self._running:
-                time.sleep(self._get_sleep_time())
+            effective_rate = self._current_effective_rate()
+            interval = 1.0 / max(0.5, effective_rate)
 
-            event_time = base_time + i * interval
+            signal = self.get_backpressure_signal()
+            if signal != self.bp_stats["last_signal"]:
+                if signal.value == 0:
+                    self.bp_stats["green_periods"] += 1
+                elif signal.value == 1:
+                    self.bp_stats["yellow_periods"] += 1
+                else:
+                    self.bp_stats["red_periods"] += 1
+                self.bp_stats["last_signal"] = signal
+                if signal.value > 0:
+                    self.bp_stats["bp_slow_events"] += 1
+
+            event_time = base_time + i * base_interval
             level = random.choices(
                 [LogLevel.DEBUG, LogLevel.INFO, LogLevel.WARN, LogLevel.ERROR, LogLevel.FATAL],
                 weights=[40, 35, 15, 8, 2]
@@ -71,7 +106,6 @@ class MockLogSource(Source):
             )
 
             if random.random() < self.out_of_order_prob:
-                delay = random.uniform(0.1, self.max_out_of_order_sec)
                 pending_events.append(event)
                 for j in range(min(3, len(pending_events))):
                     if random.random() < 0.5:
@@ -80,6 +114,8 @@ class MockLogSource(Source):
                         self.emit(late_event)
             else:
                 self.emit(event)
+
+            sent_in_window += 1
 
             if i % 50 == 0:
                 while pending_events:
@@ -90,8 +126,19 @@ class MockLogSource(Source):
         for e in pending_events:
             self.emit(e)
 
-        time.sleep(2)
         self._running = False
+
+    def get_stats(self) -> Dict[str, Any]:
+        stats = dict(self.metrics)
+        stats.update({
+            "bp_slow_events": self.bp_stats["bp_slow_events"],
+            "green_periods": self.bp_stats["green_periods"],
+            "yellow_periods": self.bp_stats["yellow_periods"],
+            "red_periods": self.bp_stats["red_periods"],
+            "effective_rate": self._current_effective_rate(),
+            "base_rate": self.rate_per_sec,
+        })
+        return stats
 
 
 class ParseStage(Stage):

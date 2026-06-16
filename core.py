@@ -96,11 +96,13 @@ class BackPressureState:
 
 
 class Stage:
-    def __init__(self, name: str):
+    def __init__(self, name: str, queue_maxsize: int = 100):
         self.name = name
         self.next_stages: List["Stage"] = []
-        self.input_queue: queue.Queue = queue.Queue(maxsize=1000)
+        self.input_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self.backpressure_state = BackPressureState()
+        self.backpressure_state.threshold_yellow = max(5, int(queue_maxsize * 0.3))
+        self.backpressure_state.threshold_red = max(10, int(queue_maxsize * 0.7))
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -122,34 +124,40 @@ class Stage:
             return
         for next_stage in self.next_stages:
             try:
-                next_stage.input_queue.put(event, timeout=0.1)
+                next_stage.input_queue.put(event, timeout=0.05)
+                next_stage._refresh_backpressure()
             except queue.Full:
                 self.metrics["dropped"] += 1
-                self._signal_backpressure(next_stage)
+                next_stage.backpressure_state.signal = BackPressureSignal.RED
                 continue
 
-    def _signal_backpressure(self, next_stage: "Stage"):
-        with self._lock:
-            bp_state = next_stage.backpressure_state
-            qsize = next_stage.input_queue.qsize()
-            bp_state.queue_size = qsize
-            if qsize >= bp_state.threshold_red:
-                bp_state.signal = BackPressureSignal.RED
-            elif qsize >= bp_state.threshold_yellow:
-                bp_state.signal = BackPressureSignal.YELLOW
-            else:
-                bp_state.signal = BackPressureSignal.GREEN
-            bp_state.last_updated = time.time()
-            self.metrics["backpressure_events"] += 1
+    def _refresh_backpressure(self):
+        bp = self.backpressure_state
+        qsize = self.input_queue.qsize()
+        bp.queue_size = qsize
+        if qsize >= bp.threshold_red:
+            bp.signal = BackPressureSignal.RED
+        elif qsize >= bp.threshold_yellow:
+            bp.signal = BackPressureSignal.YELLOW
+        else:
+            bp.signal = BackPressureSignal.GREEN
+        bp.last_updated = time.time()
 
-    def get_backpressure_signal(self) -> BackPressureSignal:
+    def get_downstream_backpressure(self) -> BackPressureSignal:
         if not self.next_stages:
             return BackPressureSignal.GREEN
         max_signal = BackPressureSignal.GREEN
         for s in self.next_stages:
+            s._refresh_backpressure()
             if s.backpressure_state.signal.value > max_signal.value:
                 max_signal = s.backpressure_state.signal
+            downstream_of_downstream = s.get_downstream_backpressure()
+            if downstream_of_downstream.value > max_signal.value:
+                max_signal = downstream_of_downstream
         return max_signal
+
+    def get_backpressure_signal(self) -> BackPressureSignal:
+        return self.get_downstream_backpressure()
 
     def start(self):
         self._running = True

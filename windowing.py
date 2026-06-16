@@ -10,6 +10,10 @@ from core import (
 )
 
 
+class _FlushSignal:
+    pass
+
+
 @dataclass
 class WatermarkState:
     current_watermark: float = 0.0
@@ -183,7 +187,7 @@ class WindowAggregationStage(Stage):
         with self._lock:
             return self._watermark.current_watermark
 
-    def _is_late(self, event: LogEvent) -> bool:
+    def _is_beyond_lateness(self, event: LogEvent) -> bool:
         watermark = self._get_watermark()
         return event.event_time() < (watermark - self.allowed_lateness)
 
@@ -194,6 +198,11 @@ class WindowAggregationStage(Stage):
     def _is_window_expired(self, window: Window) -> bool:
         watermark = self._get_watermark()
         return watermark >= (window.end + self.allowed_lateness)
+
+    def _window_has_fired(self, state_key: Tuple) -> bool:
+        with self._lock:
+            meta = self._window_metadata.get(state_key, {})
+            return meta.get("fired", False)
 
     def _merge_session_windows(self, key: Any, new_window: Window) -> Window:
         if self.window_type != WindowType.SESSION:
@@ -225,13 +234,16 @@ class WindowAggregationStage(Stage):
         return merged
 
     def process(self, event: Any) -> Optional[List[AggregationResult]]:
+        if isinstance(event, _FlushSignal):
+            return self._flush_all_windows()
+
         if not isinstance(event, LogEvent):
             return None
 
         self._update_watermark(event.event_time())
 
-        if self._is_late(event):
-            return self._handle_late_event(event)
+        if self._is_beyond_lateness(event):
+            return self._handle_expired_event(event)
 
         results: List[AggregationResult] = []
         key = self._extract_key(event)
@@ -244,6 +256,9 @@ class WindowAggregationStage(Stage):
                 win = self._merge_session_windows(key, win)
 
             state_key = (key, win.start, win.end)
+            window_ready = self._is_window_ready(win)
+            fired_before = False
+            side_output_this = False
 
             with self._lock:
                 if state_key not in self._window_states:
@@ -254,12 +269,33 @@ class WindowAggregationStage(Stage):
                         "fired": False
                     }
 
-                self._window_states[state_key] = self.aggregator.add(
-                    self._window_states[state_key], event
-                )
-                self._window_metadata[state_key]["last_updated"] = time.time()
+                fired_before = self._window_metadata[state_key].get("fired", False)
+                is_late_arrival = fired_before and window_ready
 
-            if self._is_window_ready(win):
+                if is_late_arrival and self.late_strategy == LateEventStrategy.SIDE_OUTPUT:
+                    side_output_this = True
+                else:
+                    self._window_states[state_key] = self.aggregator.add(
+                        self._window_states[state_key], event
+                    )
+                    self._window_metadata[state_key]["last_updated"] = time.time()
+
+            if side_output_this and self.side_output:
+                self._late_events_count += 1
+                try:
+                    self.side_output.input_queue.put(event, timeout=0.01)
+                except:
+                    pass
+                continue
+
+            is_late_arrival = fired_before and window_ready
+            if is_late_arrival:
+                self._late_events_count += 1
+                if self.late_strategy == LateEventStrategy.UPDATE:
+                    fired = self._try_fire_window(win, key, is_late_update=True)
+                    if fired:
+                        results.append(fired)
+            elif window_ready and not fired_before:
                 fired = self._try_fire_window(win, key)
                 if fired:
                     results.append(fired)
@@ -271,50 +307,41 @@ class WindowAggregationStage(Stage):
 
         return results if results else None
 
-    def _handle_late_event(self, event: LogEvent) -> Optional[List[AggregationResult]]:
+    def _handle_expired_event(self, event: LogEvent) -> Optional[List[AggregationResult]]:
         self._late_events_count += 1
+        self.metrics["dropped"] += 1
 
-        if self.late_strategy == LateEventStrategy.DISCARD:
-            self.metrics["dropped"] += 1
-            return None
+        if self.late_strategy == LateEventStrategy.SIDE_OUTPUT and self.side_output:
+            try:
+                self.side_output.input_queue.put(event, timeout=0.01)
+            except:
+                pass
+        return None
 
-        key = self._extract_key(event)
-        assigned_windows = self.window_assigner.assign_windows(event.event_time())
+    def _flush_all_windows(self) -> Optional[List[AggregationResult]]:
         results: List[AggregationResult] = []
 
-        for win in assigned_windows:
-            win.key = key
-            state_key = (key, win.start, win.end)
+        with self._lock:
+            all_keys = list(self._window_metadata.keys())
 
-            with self._lock:
-                if self._is_window_expired(win):
-                    self.metrics["dropped"] += 1
-                    if self.side_output and self.late_strategy == LateEventStrategy.SIDE_OUTPUT:
-                        try:
-                            self.side_output.input_queue.put(event, timeout=0.01)
-                        except:
-                            pass
-                    continue
+        for state_key in all_keys:
+            key, w_start, w_end = state_key
+            window = Window(start=w_start, end=w_end, key=key)
+            meta = self._window_metadata.get(state_key, {})
 
-                if state_key not in self._window_states:
-                    self._window_states[state_key] = self.aggregator.create()
-                    self._window_metadata[state_key] = {
-                        "created_at": time.time(),
-                        "last_updated": time.time(),
-                        "fired": True
-                    }
-
-                self._window_states[state_key] = self.aggregator.add(
-                    self._window_states[state_key], event
-                )
-                self._window_metadata[state_key]["last_updated"] = time.time()
-
-            if self.late_strategy == LateEventStrategy.UPDATE:
-                fired = self._try_fire_window(win, key, is_late_update=True)
+            if not meta.get("fired", False):
+                fired = self._try_fire_window(window, key)
                 if fired:
                     results.append(fired)
 
         return results if results else None
+
+    def flush(self):
+        signal = _FlushSignal()
+        self.input_queue.put(signal)
+
+    def _handle_late_event(self, event: LogEvent) -> Optional[List[AggregationResult]]:
+        return None
 
     def _try_fire_window(self, window: Window, key: Any,
                          is_late_update: bool = False) -> Optional[AggregationResult]:
